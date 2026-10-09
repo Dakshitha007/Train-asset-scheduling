@@ -1,0 +1,7 @@
+# EDA Outputs Directory
+# This folder stores exploratory data analysis visual artifacts, including:
+# - Correlation Heatmaps
+# - Distribution Plots
+# - Boxplots
+# - Pairplots
+# - Feature Importance Charts

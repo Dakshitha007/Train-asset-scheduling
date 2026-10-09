@@ -1,0 +1,628 @@
+RAILOPT AI - PROJECT TECHNICAL REPORT
+=====================================
+
+Evidence scope and reading guide
+--------------------------------
+This report reflects the source, configuration, artifacts, notebooks, and runtime facts inspected in this repository. "Implemented" means code or a runtime artifact exists; README descriptions alone are not proof. "Verified" means it was actually run or checked during the project work. The local backend/.env contains database configuration; no credential values are reproduced here.
+
+
+1. PROJECT OVERVIEW
+-------------------
+
+Beginner-friendly overview
+RailOpt AI is a railway maintenance decision-support prototype. A client sends operational details for one or more railway assets. The backend applies saved preprocessing and a trained regression model to estimate a maintenance priority score from 0 to 100. For optimization requests, the backend passes eligible assets and the model scores to an OR-Tools CP-SAT scheduler. The scheduler assigns maintenance starts and crews subject to defined track, time-window, crew-capacity, and critical-deadline rules. The result and supporting records are persisted in PostgreSQL and returned as JSON.
+
+The raw workbook is synthetic training data, not a live railway telemetry connection. The system's "asset availability" response is a formula based on planned maintenance hours; it is not a measured reliability or service-uptime prediction.
+
+Technical identity
+- Project: RailOpt AI
+- Descriptive title: AI-Powered Automatic Block Planning to Maximize Asset Availability for Train Operations
+- Problem addressed: prioritizing maintenance and arranging track work in a way that accounts for scarce crews, access windows, track conflicts, traffic peaks, and operational disruption.
+- A maintenance block in the project is a time interval in which a maintenance job occupies its track/station conflict group.
+- Intended users are described as railway engineers, maintenance planners, section engineers, and block controllers. No user-authentication flow is wired into the currently exposed API.
+
+Actual online workflow
+Client-submitted asset records and planning controls
+  -> FastAPI/Pydantic validation
+  -> shared backend preprocessing and saved model artifacts
+  -> XGBoost priority scores
+  -> strict priority-threshold selection
+  -> OR-Tools CP-SAT schedule
+  -> PostgreSQL predictions, asset state, requests, schedules, run, and audit event
+  -> JSON response with schedule and aggregate metrics
+
+The optimizer accepts assets in the request body; it does not automatically load a candidate asset set from the database.
+
+
+2. ACTUAL TECHNOLOGY STACK
+--------------------------
+
+Versions below are from the selected project virtual environment at audit time, unless marked "manifest only". Version declarations in manifests are ranges rather than exact locks.
+
+Technology | Evidence/use | Why present | Status
+Python 3.14.7 | Active .venv; project pyproject requires Python >=3.10 | Runs CLI, backend, processing, and notebooks | Used
+FastAPI 0.142.1 | backend/app/main.py and backend/app/api | HTTP API and lifecycle | Used; startup and basic HTTP checked
+Uvicorn 0.54.0 | backend/app/__main__.py and README run command | ASGI server | Used to start backend
+Pydantic 2.13.5 | backend/app/database/schemas.py | Request validation and response serialization | Used
+SQLAlchemy 2.1.1 | backend/app/database | ORM, engine, sessions, queries | Used
+PostgreSQL 17.11 | PostgreSQL service/database configuration and migrated schema | Persistent backend database | Used; connection and Alembic migration verified
+psycopg2-binary 2.9.13 | Installed package and configured postgresql+psycopg2 driver | PostgreSQL DBAPI | Used; driver matches configuration
+Alembic 1.20.0 | backend/migrations and alembic.ini | Versioned PostgreSQL schema migration | Used; current revision 0001_initial_schema
+python-dotenv 1.2.3 | backend/app/core/config.py | Reads backend/.env and root .env | Used
+Pandas 3.0.6 | src/data, training, preprocessing | Tabular input and feature/data handling | Used
+NumPy 2.5.3 | training, validation, evaluation | Numeric arrays and metric calculation | Used
+scikit-learn 1.9.1 | preprocessing artifact creation/notebooks and metrics utilities | Scaling, encoders, and metric helpers | Used in saved preprocessing path
+XGBoost 3.4.1 | src/models/train.py and best_model.pkl | Priority-score regression | Used; trained model loads
+OR-Tools 9.15.6755 | backend/app/services/optimization_service.py | CP-SAT scheduling model and solver | Used in backend optimization path
+Joblib 1.6.0 | model registry and training | Loads/saves model and transforms | Used
+openpyxl 3.1.5 | Excel dataset read support | Reads .xlsx workbook through Pandas | Used
+Matplotlib 3.11.2 and Seaborn 0.13.2 | src/visualization and notebooks | EDA and diagnostic plots | Used/available; no live dashboard chart integration
+Jupyter 1.1.1 | notebooks/*.ipynb and root requirements | Interactive data work | Present; notebook execution is partial
+LightGBM 4.7.0 | 04_model_training.ipynb and backend dependency manifest | A candidate in notebook code | Notebook code exists; that notebook is not meaningfully executed in saved state
+PuLP 4.0.0 | pyproject.toml, root dependency list, src/models/optimize.py description | Was contemplated for optimization | Not used by active backend scheduler; src solver remains a stub
+SHAP | Notebook code and root requirements | Planned model explanations | Not installed in selected .venv; explainability notebook unexecuted
+Streamlit | frontend/app.py imports it | Intended interactive UI | Not listed in root/backend requirements and not installed in selected .venv
+Plotly 7.1.0 | Root dependency list / installed environment | No current active path found in the inspected frontend | Dependency only; no implemented Plotly view identified
+setuptools | pyproject build-system | Python package build metadata | Declared
+Standard-library logging/json/pathlib/time/argparse | Several Python modules | CLI, configuration, structured logs, timing, serialization | Used
+
+No Dockerfile, compose file, cloud deployment configuration, external railway/weather/timetable API integration, or repository test suite was found. No frontend package.json or JavaScript build stack exists.
+
+Dependency-manifest caveats:
+- Root requirements.txt is broad data-science requirements (including packages not used by the production request path).
+- backend/requirements.txt is the backend dependency set and declares psycopg v3, while the active application configuration now uses psycopg2. The installed psycopg2 package and live project configuration work; the backend manifest should be reconciled before a clean backend-only reinstall.
+- pyproject.toml still declares PuLP, but the functioning API optimizer uses OR-Tools CP-SAT.
+- The frontend imports Streamlit, but the selected environment lacks Streamlit and neither inspected requirements file lists it.
+
+
+3. PROJECT ARCHITECTURE
+-----------------------
+
+Actual architecture: modular Python codebase with a client-server/API backend, a separate data/model pipeline, a database, notebooks, and a Streamlit UI shell. It is not a microservice system. It is partly pipeline-based for offline data/training and request-based for online inference/scheduling. It is not a single fully integrated frontend-to-backend application yet.
+
+Component | Purpose | Input -> processing -> output | Main files
+Data/model pipeline | Prepare tabular training features and train priority regression | XLSX -> preprocessing/splits -> model artifacts and metrics | src/data/, src/features/, src/models/train.py, notebooks/03_data_preprocessing.ipynb
+Model serving | Reuse fitted model transforms and return validated scores | API asset fields -> feature frame -> model predict -> 0..100 scores | backend/app/core/model_registry.py, backend/app/utils/preprocessing.py, backend/app/services/prediction_service.py
+API | Validate requests and expose asset, prediction, optimization, and dashboard operations | HTTP JSON -> Pydantic -> service -> JSON | backend/app/main.py, backend/app/api/
+Optimization | Choose start offsets and schedule tasks | Eligible assets and model priorities -> CP-SAT -> schedule | backend/app/services/optimization_service.py
+Persistence | Store current assets and operation/prediction history | ORM entities and transaction commits -> PostgreSQL | backend/app/database/, backend/migrations/
+UI shell | Present prototype navigation and a raw workbook preview | Local XLSX on explicit button -> Streamlit dataframe | frontend/app.py
+
+Important: frontend currently does not call the backend. Its metrics are hard-coded, its prediction and optimization views are text placeholders, and its raw-data preview reads the workbook directly.
+
+
+4. FOLDER-BY-FOLDER EXPLANATION
+-------------------------------
+
+Folder/file | Actual purpose
+data/raw/ | Contains railway_synthetic_training_dataset_7000.xlsx and placeholder .gitkeep.
+data/processed/ | Existing train.csv, validation.csv, test.csv; each has 24 feature columns and priority_score target.
+data/external/ | Placeholder only; no external source integration found.
+src/config/ | Filesystem locations, random seed, split constants, and prototype scheduling defaults.
+src/data/ | Raw XLSX/CSV loader, required-column check, duplicate removal, and generic split helper.
+src/features/ | Legacy/generic feature-engineering and scikit-learn transformer helper; not the exact serving pipeline.
+src/models/ | Priority training is implemented; standalone predict and optimize modules raise NotImplementedError.
+src/utils/ | Basic logging and joblib/json/directory helpers.
+src/visualization/ | Priority distribution/feature importance plots are implemented; schedule Gantt function is a placeholder.
+notebooks/ | Six exploratory/training/explainability/optimization notebooks plus guidance README.
+outputs/models/ | Trained best_model.pkl, ordered feature_columns.pkl, scaler.pkl, six categorical encoders.
+outputs/reports/ | training_metrics.json with saved candidate, validation, and test results.
+backend/app/ | Current FastAPI application, schema, ORM, preprocessing, registry, services, and routes.
+backend/migrations/ | Alembic environment and one initial PostgreSQL schema migration.
+backend/scripts/ | Optional idempotent development seed script; not required for starting service.
+frontend/ | Streamlit prototype shell and README claims that exceed current UI code.
+app/ | Legacy import compatibility layer and older Pydantic request/response definitions; not the active service implementation.
+README.md | Broad project overview and some stale/aspirational descriptions; not authoritative where code differs.
+requirements.txt | Root data-science stack; not a lock file.
+backend/requirements.txt | Backend runtime dependency ranges.
+pyproject.toml | setuptools metadata, Python >=3.10, and a smaller top-level dependency set.
+alembic.ini | Alembic script location and safe fallback URL; credentials load through app settings.
+backend/.env | Local database configuration exists; sensitive values intentionally omitted from this report. .gitignore ignores .env and .env.*.
+
+Important individual Python files:
+- main.py: CLI supports status and data stages, and invokes src.models.train.run_training_pipeline for train. features/evaluate/optimize/all report that development is staged rather than executing those stages.
+- src/data/load_data.py: reads .xlsx/.xls/.csv and checks that the raw schema contains expected columns.
+- src/data/preprocess.py: generic drop_duplicates and train_test_split helper; missing-value imputation is not implemented here.
+- src/features/build_features.py: adds track_traffic_burden, defect_pressure_rate, weather_stress_index; offers a ColumnTransformer. Its field groupings do not match the final 24-feature model schema exactly, and it is not the serving preprocessing implementation.
+- src/models/train.py: validates processed splits and artifacts, compares two XGBoost regressors, selects by validation R2 then RMSE, refits train+validation, evaluates test, saves model/schema/metrics, and wraps predictions to clip to 0..100. A failure-classifier function is an explicit NotImplementedError.
+- src/models/evaluate.py: computes regression MAE, RMSE, R2; also has classification metrics helper, though there is no failure classifier pipeline.
+- src/models/predict.py: both priority and failure prediction functions raise NotImplementedError. The active inference service is under backend/.
+- src/models/optimize.py: standalone legacy optimization stub raising NotImplementedError. The active optimizer is the FastAPI backend service.
+- backend/app/main.py: creates FastAPI app, configures CORS/logging/error handlers, verifies DB at lifespan startup, loads model bundle, and disposes DB engine on shutdown.
+- backend/app/core/config.py: reads environment configuration with python-dotenv; backend/.env is loaded before root .env, both without overriding existing environment values.
+- backend/app/core/model_registry.py: loads model, feature order, scaler, and six encoders once.
+- backend/app/utils/preprocessing.py: converts API asset records into the exact trained numeric model schema, encodes categories, engineers five serving features, scales, and orders columns.
+- backend/app/services/optimization_service.py: ML-to-CP-SAT path, schedule results/metrics, and transaction persistence.
+- backend/app/database/models.py and schemas.py: database entities and API input/output validation models, respectively.
+- backend/migrations/versions/0001_initial_schema.py: initial relational PostgreSQL schema.
+- frontend/app.py: five navigation choices, hard-coded dashboard measures, optional preview of 10 raw workbook rows, and placeholder text in other screens.
+- app/api.py: backwards-compatible import of backend.app.main:app; app/schemas.py contains an older unused API contract.
+
+
+5. NOTEBOOKS
+------------
+
+Notebook | Actual contents | Saved execution state
+01_data_loading_and_understanding.ipynb | Loads raw XLSX, reports runtime/data dimensions, dtypes, missingness, duplicates, physical-bound checks, summaries, feature/target taxonomy. | 26 cells; none executed in saved notebook.
+02_exploratory_data_analysis.ipynb | Numerical/categorical EDA, outlier audit, correlations, target distribution, bivariate/pairwise plots, business insights. | 27 cells; none executed in saved notebook.
+03_data_preprocessing.ipynb | Missing-value treatment, duplicate removal, domain validation, categorical encoding, domain-derived features, reproducible 70/15/15 splits, train-fitted StandardScaler, writes processed CSVs and scaler/encoders. | 25 cells; 12 executed and have outputs.
+04_model_training.ipynb | Notebook code compares Random Forest, XGBoost, LightGBM, Gradient Boosting, Extra Trees; includes 5-fold CV, randomized search, plots, and artifacts. This is distinct from src/models/train.py, which compares two XGBoost configurations. | 25 cells; one code cell executed, not a completed saved notebook run. Do not attribute notebook CV/tuning outcomes to the saved model.
+05_model_explainability.ipynb | Loads a model and test split; intends feature importance, SHAP global/dependence/waterfall explanations and error review. | 21 cells; none executed. SHAP is not installed in selected environment.
+06_block_optimization.ipynb | Intended prototype derives requests and schedule from model/data and uses scheduling/optimization code; contains thresholds and objective/constraint sections. Separate from production backend implementation. | 23 cells; none executed.
+
+The notebooks README names an older five-notebook sequence and different subjects for notebooks 04/05; actual files now include six notebooks with different names. Notebook Markdown contains hypotheses/interpretations; those are not treated as measured results unless supported by executed code/artifacts.
+
+
+6. DATASET / DATA PIPELINE
+--------------------------
+
+Raw source: data/raw/railway_synthetic_training_dataset_7000.xlsx
+- Observed shape: 7,000 rows x 22 columns.
+- No missing values or exact duplicate rows in the current workbook.
+- priority_score spans 14..100; observed mean is about 82.36.
+- The workbook filename identifies it as synthetic; the repository does not demonstrate a live railway feed.
+- Categorical values observed: asset_type (Bridge, OHE, Signal, Switch, Track); zone (Central, East, North, South, West); defect_severity (High, Low, Medium); weather (Cloudy, Fog, Rain, Sunny); passenger_peak and nearby_alternate_track (Yes/No).
+
+Raw fields:
+asset_id (identifier); asset_type; zone; station; asset_age_years; last_maintenance_days; defect_count; defect_severity; inspection_score; train_frequency; average_speed; weather; temperature; rainfall; axle_load; crew_available; maintenance_duration; passenger_peak; nearby_alternate_track; previous_failures; predicted_failure_probability; priority_score.
+
+Model target and features:
+- Target: priority_score, a numeric 0..100 maintenance priority score.
+- Fitted model inputs: 24 fields. The 19 retained raw predictors are asset_type, zone, asset_age_years, last_maintenance_days, defect_count, defect_severity, inspection_score, train_frequency, average_speed, weather, temperature, rainfall, axle_load, crew_available, maintenance_duration, passenger_peak, nearby_alternate_track, previous_failures, predicted_failure_probability.
+- Five derived serving features: maintenance_overdue_ratio = last_maintenance_days / max(asset_age_years*365, 1); risk_index = defect_count * predicted_failure_probability; traffic_load_score = train_frequency * axle_load; asset_health_score = inspection_score - 5*defect_count; asset_utilization = train_frequency / max(average_speed, 1).
+- station, track_id, installation_date, status, and asset_id are not model inputs. station and track_id are used in scheduling/grouping; installation_date/status are persisted/validated; asset_id identifies records.
+- `predicted_failure_probability` is supplied as an input feature and stored value. The trained model predicts priority_score, not failure probability.
+
+Processed split files: train.csv 4,900 rows; validation.csv 1,050; test.csv 1,050. Each currently has 25 columns (24 features + target), no missing values, numeric model inputs, and target in [0,100]. The splits total 7,000 rows and reflect 70/15/15 proportions. The preprocessing notebook documents fitting encoders/scaler only on training rows. Feature engineering and preprocessing are not a single unified runtime pipeline: the backend has its own parity implementation that consumes the saved Stage 3 artifacts.
+
+Potential modeling caveat: the target is synthetic and predicted_failure_probability is itself already present in the input workbook and is a strong priority signal in notebook EDA. The high saved test score is evidence of fit to this dataset, not proof of real-world failure prediction, calibration, or operational benefit.
+
+
+7. MACHINE LEARNING
+-------------------
+
+Problem type: supervised regression for maintenance priority, not binary classification and not failure probability prediction.
+
+Production training implementation: src/models/train.py.
+1. Reads existing train/validation/test CSVs and rejects empty splits, schema mismatches, missing/non-numeric/non-finite values, or target outside 0..100.
+2. Loads existing scaler and six fitted categorical encoders and checks that the feature schema matches backend contract.
+3. Compares two candidates: XGBoost tree booster and XGBoost linear booster.
+4. Selects highest validation R2, with lower validation RMSE tie-break.
+5. Refits selected model on train plus validation; keeps test for final evaluation.
+6. Saves best_model.pkl, feature_columns.pkl, and training_metrics.json. Reuses scaler/encoders unchanged.
+7. BoundedPriorityRegressor clips estimator output to [0,100]; backend validates finite values and score range.
+
+Saved result (outputs/reports/training_metrics.json):
+- Selected model: "Gradient-Boosted Trees" XGBRegressor.
+- Validation: MAE 0.3646, RMSE 0.5987, R2 0.9976.
+- Final train+validation refit fit metrics: MAE 0.1504, RMSE 0.2080, R2 0.9997.
+- Held-out test: MAE 0.3179, RMSE 0.5102, R2 0.9982.
+- Training split rows: 4,900; validation: 1,050; test: 1,050.
+- Comparator, Regularized Linear Booster validation: MAE 2.2625, RMSE 3.6781, R2 0.9094.
+
+Artifacts present: outputs/models/best_model.pkl; feature_columns.pkl; scaler.pkl; encoders/encoder_{asset_type,zone,weather,defect_severity,passenger_peak,nearby_alternate_track}.joblib. Registry loading and backend inference on real workbook rows were run successfully; score values were finite and in range. This does not validate generalization to real operational data.
+
+Not implemented: failure classifier/training labels; calibrated failure probability model; production retraining trigger/monitoring; automated drift assessment. src/models/predict.py is placeholder; serving inference uses backend/app/services/prediction_service.py.
+
+
+8. OPTIMIZATION / BLOCK SCHEDULING
+----------------------------------
+
+Active optimizer: OR-Tools CP-SAT in backend/app/services/optimization_service.py. The separate src/models/optimize.py is a stub, and the optimization notebook is unexecuted.
+
+Decision variables per priority-eligible asset include Boolean scheduled flag, integer start/end hour offsets, peak-overlap hours, daytime-window indicator, and an optional interval. Unscheduled assets use a sentinel start offset.
+
+Input: request assets and crew/horizon/threshold controls; predicted priority from the shared ML service. Priority threshold comparison is strict: priority > priority_threshold (default 75). Critical if priority >= critical_priority_threshold (default 95). Threshold ordering is schema-validated.
+
+Hard constraints:
+- Task interval duration is max(1, ceil(maintenance_duration)).
+- Start/end must fit the planning horizon and one of the generated allowed windows.
+- Standard tasks use overnight 20:00-08:00 windows; critical tasks may also use 00:00-12:00 daytime window.
+- Critical assets must be scheduled, with start offset strictly less than 24 hours. If other hard constraints make this impossible, the model may be infeasible and API returns an error.
+- Same track groups cannot overlap, using track_id or fallback station as group, through AddNoOverlap.
+- AddCumulative caps simultaneous one-crew tasks at request.available_crews.
+- Asset crew_available == 0 forces its task unscheduled.
+
+Soft/objective factors:
+- Rewards scheduling and higher priority, earlier completion, and using available crew-hours.
+- Penalizes estimated train impact, maintenance duration, missing alternate track, passenger-peak overlaps, and critical daytime use.
+- Passenger peaks are 07:00-10:00 and 16:00-20:00. Passenger peak asset flag doubles the overlap penalty. Peak is a penalty, not an absolute exclusion.
+- Alternate track absence is an objective penalty, not a hard constraint.
+- Objective weights live in backend/app/core/constants.py. The solver uses configured seconds (default 30), one worker, and fixed random seed 42. Solver can report OPTIMAL or FEASIBLE.
+- Crew names are assigned after solving by placing sorted scheduled jobs on earliest-free crews; each scheduled task consumes one crew.
+
+Schedule output includes asset/track/station, start/end, crew, ML score, schedule status, duration, and objective-derived per-item score. Response metrics include schedule count/request count, delay, availability, crew utilization, completion, estimated impacts, objective value, status, and solver time.
+
+Metric definitions are important:
+- availability = 100 * (1 - scheduled maintenance hours / (input asset count * horizon hours)).
+- crew utilization = 100 * (scheduled maintenance hours / (available crews * horizon hours)).
+- completion = scheduled eligible tasks / eligible request count * 100.
+- estimated train impacts per job = ceil(train_frequency * rounded_duration / 24).
+These are model/service formulas, not measured fleet availability or actual delayed trains. Scheduling is decision support, not dispatch authority.
+
+
+9. DATABASE
+-----------
+
+Database: PostgreSQL, running locally on port 5432; database railopt_ai. Alembic revision 0001_initial_schema was applied and inspected. PostgreSQL connection and the application health check have succeeded. SQLAlchemy 2.x ORM is used; Alembic controls PostgreSQL schema. PostgreSQL tables are not auto-created by application startup.
+
+Table | Principal fields and purpose | Key relationships
+users | id, name, email, password_hash, role, created_at, updated_at; accounts/roles | audit_logs.user_id -> users.id (nullable, SET NULL)
+railway_assets | asset_id PK; type/location/track/date/age; maintenance, defect, inspection, traffic, weather, crew, alternate track, failure-probability input, status, timestamps | parent of predictions and maintenance_requests
+predictions | prediction_id PK; asset_id; predicted_priority_score; supplied predicted_failure_probability; model_version; timestamp | asset_id -> railway_assets
+optimization_runs | run_id PK; solver_status, objective_score, request_count, scheduled_count, solver_seconds, created_at | parent of optimized_schedule
+maintenance_requests | request_id PK; asset_id; priority, supplied failure probability, duration, preferred_window, crew_required, status, created_at | asset_id -> railway_assets; one-to-one optimized_schedule
+optimized_schedule | schedule_id PK; run_id; request_id; crew, start/end, optimization_score, status | run_id -> optimization_runs; request_id -> maintenance_requests, unique
+audit_logs | log_id PK; nullable user_id; action, entity, entity_id, details, timestamp | user_id -> users, SET NULL
+alembic_version | version_num | Alembic current schema revision
+
+Actual DB inspection showed application tables audit_logs, maintenance_requests, optimization_runs, optimized_schedule, predictions, railway_assets, users; revision 0001_initial_schema. Models define check constraints, unique constraints, foreign keys, and indexes for common lookup/filter fields. Database CRUD occurs in backend/app/services/asset_service.py, prediction_service.py, optimization_service.py, and dashboard_service.py. The optimization transaction stores input asset state, predictions, an optimization run, eligible maintenance requests, schedule dispositions, and an audit log.
+
+
+10. BACKEND / API
+-----------------
+
+Framework and entry point: FastAPI application at backend/app/main.py. Standard run: python -m uvicorn backend.app.main:app --host 0.0.0.0 --port 8000. The backend starts by verifying the DB and loading model artifacts. Root and health HTTP checks have returned 200; health reported model_loaded and database_connected true.
+
+Method | Endpoint | Purpose/input/output
+GET | / | Service greeting in ApiResponse envelope.
+GET | /health | Dependency readiness; returns model_loaded, database_connected, model_version or 503.
+GET | /assets | Paginated asset query (limit, offset, optional type/zone) -> page.
+POST | /assets | Validated AssetCreate -> asset resource, 201.
+GET | /assets/{asset_id} | Fetch one persisted asset.
+PATCH | /assets/{asset_id} | Merge partial update, validate full resulting asset, persist.
+DELETE | /assets/{asset_id} | Delete asset; database cascades related entities per schema.
+POST | /prediction | One asset -> model priority; persists current asset, prediction, audit row.
+POST | /prediction/batch | Bounded unique-asset batch -> scores and persistence.
+POST | /optimization | OptimizationRequest with assets and controls -> ML predictions, CP-SAT result and database persistence.
+GET | /dashboard/summary | Database-backed summary KPIs.
+GET | /dashboard/charts | Database-backed category, score distribution, schedule status, and trend data.
+
+Successful responses use success/message/data. Pydantic rejects extra fields and enforces domain bounds/enums; asset request is 1..500 records with unique IDs. Errors are normalized for HTTP validation, database conflicts/errors, and unexpected exceptions.
+
+Optimization request flow:
+POST /optimization -> OptimizationRequest -> startup ModelBundle dependency -> prediction_service.predict_priority_values -> prepare_model_features -> saved encoder/scaler and model -> validate predictions -> optimizer selects threshold-eligible tasks -> CP-SAT -> transaction persists rows -> OptimizationResult response.
+
+No authentication/authorization dependency is attached to these routers; User/role schema and seeding exist, but login/token/role enforcement is not implemented in the inspected route path. No endpoint currently retrieves optimizer candidates from DB automatically.
+
+
+11. FRONTEND / UI
+-----------------
+
+Technology: Streamlit Python file frontend/app.py.
+Implemented UI: page title/caption and sidebar with Dashboard Overview, Asset Health & Defect Monitoring, Failure Risk Prediction, Maintenance Block Optimizer, and System Settings.
+- Overview shows hard-coded example metrics and initialization text.
+- Asset view checks raw workbook path and, on button click, previews first 10 rows using Pandas.
+- Prediction view says inference pipeline will be linked.
+- Optimizer view is explanatory placeholder only.
+- Settings view is explanatory placeholder only.
+- No backend HTTP calls, stateful API integration, real schedule table, charts, maps, what-if controls, or DB-backed UI were found.
+
+frontend/README.md describes a live asset map, heatmaps, timetable generator, and scenario simulator; those components are not present in frontend/app.py. Streamlit is absent in the selected virtual environment and not declared by inspected requirements files, so this environment cannot currently run the UI without dependency setup.
+
+
+12. CONFIGURATION
+-----------------
+
+backend/app/core/config.py loads backend/.env, then root .env, without overriding existing process environment values. DATABASE_URL is the database setting; the local backend/.env is configured, but this report intentionally does not show its value or credentials. .gitignore ignores .env and .env.* and allows example files.
+
+Settings include app name/version/environment/log level; DATABASE_URL; database echo; SQLite-only schema auto-create; paths for model/schema/scaler/encoders; CORS origins; maximum batch size; CP-SAT solver time limit. Default DB URL uses PostgreSQL and psycopg2 driver; deployment URL is supplied locally. PostgreSQL schema uses Alembic.
+
+pyproject.toml declares package railopt-ai 0.1.0, Python >=3.10 and setuptools. Root requirements and backend/requirements use ranged, non-locking dependencies. alembic.ini points to backend/migrations; backend/migrations/env.py obtains URL from application settings rather than exposing credentials in migration code. No Docker/YAML deployment config or package.json exists.
+
+
+13. DEPENDENCY MAP
+------------------
+
+Data ingestion -> Pandas + openpyxl -> workbook/csv loading.
+Feature/training -> Pandas + NumPy + scikit-learn transforms + XGBoost -> fitted score model.
+Artifact IO -> Joblib -> persisted model, scaler, encoders, feature ordering.
+Online HTTP -> FastAPI + Uvicorn + Pydantic -> validated REST endpoints.
+Scheduling -> OR-Tools CP-SAT -> constraint model and feasible/optimal block offsets.
+Persistence -> SQLAlchemy + psycopg2 + PostgreSQL -> operational records.
+Schema evolution -> Alembic -> versioned DB migration.
+Configuration -> python-dotenv + os/pathlib -> environment settings and artifact paths.
+EDA -> Matplotlib/Seaborn/Jupyter -> exploratory plots and analysis notebooks.
+UI prototype -> Streamlit import in frontend/app.py -> unconnected dashboard shell.
+
+
+14. COMPLETE DATA FLOW
+----------------------
+
+Offline data/training:
+XLSX (7,000 synthetic rows, 22 fields)
+ -> preprocessing notebook cleans/validates/encodes/engineers and partitions records
+ -> train/validation/test CSVs (4,900/1,050/1,050; each 24 model features + target)
+ -> src/models/train.py compares two XGBoost estimators, selects by validation R2/RMSE
+ -> best_model.pkl, feature_columns.pkl, reused scaler/encoders, training_metrics.json.
+
+Online optimization:
+Client raw asset attributes and controls
+ -> Pydantic schema validates domains, derives installation_date if omitted
+ -> backend preprocessor drops ID/location/date/status from the feature frame, derives five features, encodes six categoricals, scales numerical fields, orders 24 columns
+ -> loaded bounded XGBoost predicts priority_score
+ -> API/service validates finite scores in 0..100 and filters priority > threshold
+ -> CP-SAT chooses schedule start/disposition under capacity and window constraints, minimizing penalties/maximizing weighted objective
+ -> metrics computed using formulas in section 8
+ -> database transaction and JSON output.
+
+Current UI path is separate: it previews raw XLSX only and does not invoke the API.
+
+
+15. COMPLETE EXECUTION FLOW
+---------------------------
+
+1. Install project/backend dependencies and set local backend/.env.
+2. Create PostgreSQL database/role administratively; run existing migration with python -m alembic upgrade head.
+3. Start Uvicorn using backend.app.main:app; startup verifies DB with SELECT 1 and attempts one-time artifact load.
+4. Current configuration/artifacts and database startup were actually verified; GET / and GET /health returned 200 in the running app.
+5. For a request, FastAPI validates JSON through schemas and injects DB session/model bundle.
+6. For prediction/optimization, shared backend preprocessing prepares trained input; XGBoost returns bounded priority.
+7. Optimizer filters candidates, forms CP-SAT model, solves and maps scheduled tasks to crew labels.
+8. Service persists records transactionally and returns JSON schedule/metrics.
+9. Frontend does not currently perform these API calls; it renders local placeholders/raw preview instead.
+
+Offline CLI: python main.py --stage status reports file readiness; --stage data loads, schema-checks, deduplicates and splits in memory but does not save splits; --stage train executes current saved-split training. stages features/evaluate/optimize/all are explicitly not wired to operations.
+
+
+16. AI/ML + OPTIMIZATION RELATIONSHIP
+------------------------------------
+
+The ML component estimates a continuous maintenance priority score. It does not forecast failure probability as its target. The API caller supplies predicted_failure_probability among asset inputs; model uses that value as one of its features.
+
+The optimizer receives each asset and its score, decides whether/when to schedule eligible work, and assigns crew labels. ML supplies a ranking signal but cannot by itself coordinate shared crew/time/track resources. CP-SAT can enforce combinatorial scheduling constraints but does not infer risk priority from sensor/asset predictors. Together, they provide prioritization followed by constrained scheduling.
+
+The integration is active in the FastAPI path; the older standalone src/models/predict.py and src/models/optimize.py are not active implementations.
+
+
+17. ALGORITHMS
+--------------
+
+Algorithm | Purpose | Input/output | File/status
+XGBoost gradient-boosted regression trees | Predict priority_score | 24 numeric features -> 0..100 score | src/models/train.py; trained artifact present
+XGBoost linear booster | Training comparator | Same features -> score | src/models/train.py; candidate only
+StandardScaler | Numerical feature scaling | Numeric fields -> standardized fields | saved scaler and backend preprocessing
+LabelEncoder-based categorical mapping | Transform six categories to model codes; unknown input mapped to __UNKNOWN__ | categories -> numeric codes | saved encoders/backend preprocessing
+Domain feature formulas | Derive risk, overdue, traffic, health, utilization | Asset features -> five derived fields | backend/app/utils/preprocessing.py
+Train/validation/test partition | Hold out validation/test data | 70/15/15 with fixed seed in preprocessing notebook | notebook + CSV artifacts
+OR-Tools CP-SAT | Schedule Boolean/interval variables subject to constraints and weighted objective | Eligible assets and constraints -> start/end/status | backend/app/services/optimization_service.py
+AddNoOverlap | Avoid time overlap within each same-track/station group | Optional intervals | CP-SAT hard constraint
+AddCumulative | Cap simultaneous jobs to available crews | Intervals with unit crew demand | CP-SAT hard constraint
+Priority thresholding | Filter before model construction | Priority > configured threshold | optimization service
+Rule-based window enumeration | Enumerate starts satisfying overnight/critical windows and count peak overlap | Plan start/duration/horizon -> feasible offsets | optimization service
+Crew label assignment | Greedily label CP-SAT schedule by earliest-free crew | Sorted scheduled intervals -> Crew-N names | optimization service after solving
+Regression metrics | MAE/RMSE/R2 | Targets and predictions -> scores | src/models/evaluate.py
+
+No asymptotic/runtime complexity claim is inferred for the CP-SAT model; solver complexity depends on model size and is bounded in application by configured time limit.
+
+
+18. TESTING
+------------
+
+No repository-owned automated test files, pytest configuration, or coverage configuration were found. The supplied notebooks have mixed/empty execution state (see section 5).
+
+Actual prior verification recorded during project work:
+- Model registry loaded saved model/artifacts; backend preprocessing produced 24 features and validated real-row scores.
+- An HTTP POST /optimization integration scenario using real workbook records, actual model, CP-SAT, and isolated SQLite assertions passed, including persistence into that test DB and constraint/metric checks.
+- PostgreSQL database creation and migration were later verified; Alembic revision 0001_initial_schema and application table names were inspected.
+- FastAPI was started with its configured PostgreSQL database; GET / and GET /health returned 200; health confirmed model_loaded and database_connected true.
+
+Not verified on the production PostgreSQL path in this recorded work: POST /optimization and prediction transaction writes against the migrated PostgreSQL database. No repeatable automated integration test protects these scenarios.
+
+
+19. SECURITY
+------------
+
+Observed mechanisms: environment-based DB connection; ignored local .env files; credentials absent from checked-in example; Pydantic field constraints/extra-forbid for core asset request schemas; SQLAlchemy parameterized ORM queries; CORS allowlist configuration; Argon2 password hashing in seed script; schema stores password_hash rather than plaintext; exception responses hide SQL detail and logs use request identifiers.
+
+Limits: no active login/authentication or route authorization found; no evidence of TLS/reverse proxy/rate limiting/deployment secret manager enforcement; the seed script creates a development administrator only when explicitly invoked with ADMIN_PASSWORD; delete endpoint has no authorization guard in inspected routes. Security improvements should be evaluated before operational exposure. Local secret contents are intentionally not documented here.
+
+
+20. ERROR HANDLING & LOGGING
+----------------------------
+
+FastAPI main normalizes HTTPException, request-validation, IntegrityError, SQLAlchemyError, and unexpected failures into success/message/data-style envelopes. Integrity errors return 409; DB errors return 503; unexpected exceptions return 500 with request ID. Startup logs model-load success/failure; DB initialization failure prevents startup. Model-artifact load failure is caught and app can start degraded; health returns 503 and inference endpoints require loaded bundle. Inference contract/runtime errors map to service unavailable. CP-SAT unavailable, infeasible, and time-limit/no-feasible outcomes have explicit API errors.
+
+Request middleware adds X-Request-ID and logs method/path/status/duration in JSON. Development data pipeline has a separate console logger. No monitoring/metrics or centralized log service configuration found.
+
+
+21. CURRENT PROJECT STATUS
+--------------------------
+
+Feature | Status | Evidence | What remains
+XLSX dataset and processed splits | Implemented | raw workbook and three CSVs; runtime counts checked | Real operational feed and data governance
+Stage 3 preprocessing artifacts | Implemented artifacts / partial reusable library | scaler and six encoders exist; notebook partially executed | Consolidate one reproducible pipeline/API contract
+Priority regression training | Implemented | train.py and metrics JSON; model artifact loaded | Evaluate on genuine operational labels
+Failure probability prediction | Not implemented as a trained target model | training classifier raises NotImplementedError; priority model target is priority_score | Real binary outcomes/model if needed
+Backend preprocessing and inference | Implemented | registry/service/utils; real-row inference checked | Model monitoring/calibration
+FastAPI routes and DB persistence | Implemented | backend/app; health/root returned 200 | Automated tests and frontend use
+CP-SAT optimizer | Implemented in backend only | optimization_service.py; integration earlier exercised | Production PostgreSQL POST verification and operational validation
+Asset availability metric | Partially implemented proxy | output formula based on scheduled hours | Define/train/validate operational availability measure
+PostgreSQL schema/migrations | Implemented | seven app tables and Alembic revision 0001 verified | Operational backups/production controls
+Streamlit screens | Partially implemented shell | frontend/app.py | API integration, real data/actions; install declared dependency
+Standalone src prediction/optimizer | Not implemented | explicit NotImplementedError | Retire or implement/reconcile duplicate path
+Automated tests | Not implemented/found | no project test files | Add unit and PostgreSQL/API integration coverage
+Deployment/observability | Planned/not found | no container/cloud config | Operational deployment design and monitoring
+Authentication/authorization | Partial data model only | user schema/seed, no auth routes | Enforce login/roles before exposure
+
+
+22. WHAT IS ACTUALLY WORKING?
+-----------------------------
+
+Verified executable paths:
+- Priority training pipeline from saved processed splits; existing artifacts and recorded metrics.
+- Model registry, feature preparation, and real-record inference.
+- FastAPI startup with migrated PostgreSQL and model bundle.
+- GET / and GET /health through running server.
+- CP-SAT optimization workflow was previously exercised through an HTTP request using isolated SQLite and assertions; this establishes the service route path but not the current PostgreSQL persistence path.
+- PostgreSQL connectivity, migration, and schema inspection.
+
+Partial/not independently verified:
+- Frontend screens are shells; selected environment cannot run Streamlit as dependency is absent.
+- Notebook 03 produced some saved execution outputs; other notebooks are mostly not executed.
+- CLI stages other than status/data/train do not execute those named pipeline stages.
+- Current production DB endpoint health is verified; POST /optimization against PostgreSQL has not yet been verified.
+
+
+23. HOW TO RUN THE PROJECT
+--------------------------
+
+Commands below are based on backend README/project files. Credentials are configured locally, not shown here.
+
+1. Prerequisites: Python >=3.10; PostgreSQL configured and reachable; compatible native model/OR-Tools packages.
+2. Create/activate venv (PowerShell):
+   python -m venv .venv
+   .\.venv\Scripts\Activate.ps1
+3. Install:
+   python -m pip install -r backend/requirements.txt
+   (For the data pipeline, root requirements.txt is also supplied; note dependency-manifest inconsistencies listed in section 2.)
+4. Configure backend/.env using the existing DATABASE_URL setting; do not expose credentials.
+5. Create the PostgreSQL database/role through administration process, then run:
+   python -m alembic upgrade head
+   Existing schema is currently at 0001_initial_schema.
+6. Start API:
+   python -m uvicorn backend.app.main:app --host 0.0.0.0 --port 8000
+7. Check:
+   http://127.0.0.1:8000/
+   http://127.0.0.1:8000/health
+   Swagger: http://127.0.0.1:8000/docs
+8. UI command documented:
+   streamlit run frontend/app.py
+   Streamlit must first be installed in the selected environment; it is not declared in current manifests.
+9. Notebooks: open notebooks/*.ipynb in Jupyter and run sequentially; notebook README encourages relative paths. No standalone test command is established because project tests were not found.
+10. CLI:
+   python main.py --stage status
+   python main.py --stage data
+   python main.py --stage train
+   Other named stages currently only print that they are staged for development.
+
+
+24. PROJECT STRENGTHS
+---------------------
+
+- Real separation between backend routes, business services, persistence models, schemas, model registry, and preprocessing.
+- Saved feature ordering and encoders/scaler are reused at inference rather than retraining per request.
+- Model output and input validation includes finite/range/schema checks.
+- CP-SAT uses explicit track non-overlap, cumulative crew, allowed-window, and critical deadline rules.
+- PostgreSQL schema is versioned with Alembic and includes integrity constraints/relationships/indexes.
+- Optimization persistence is transactional; the model registry loads once at startup.
+- The API was started and basic health/database readiness verified in the configured local environment.
+
+
+25. CURRENT LIMITATIONS
+-----------------------
+
+- Training data is synthetic; near-perfect regression scores may reflect the synthetic target-generation relationships and do not establish operational validity.
+- No true failure-probability target/model despite parts of README and legacy modules saying failure prediction.
+- Input is submitted by caller; there is no live sensors, timetable, GIS, weather, or DB candidate-selection integration.
+- Track identity absent from raw training workbook; scheduler falls back to station when track_id is null.
+- Availability and train-impact metrics are simplified estimates, not observed service/reliability measures.
+- Frontend neither calls backend nor presents live results.
+- Two parallel implementations/contracts exist: current backend and older root app/src placeholders.
+- Root CLI feature/evaluate/optimize/all stages are not implemented.
+- No repository automated tests or production monitoring/deployment configuration found.
+- Authentication/authorization is not wired into API endpoints.
+- Backend dependency manifest currently declares psycopg v3 while active settings/use use psycopg2; fresh installation reproducibility needs manifest reconciliation.
+
+
+26. FUTURE IMPROVEMENTS
+-----------------------
+
+A. Immediate
+- Add repeatable API/DB integration tests against PostgreSQL, especially prediction and optimization persistence.
+- Connect the Streamlit shell to backend endpoints and replace hard-coded metrics/placeholders.
+- Declare Streamlit in an appropriate frontend/backend dependency manifest.
+- Reconcile backend PostgreSQL driver dependency with its configured psycopg2 URL.
+- Document track_id data requirements and distinguish estimated availability from true asset uptime.
+
+B. Short-term
+- Validate labels/features with real historical maintenance/failure observations; document synthetic label-generation assumptions.
+- Add authentication and role authorization to data-changing routes.
+- Refactor duplicate legacy model/optimization paths or clearly retire them.
+- Make preprocessing and split generation one reproducible, tested pipeline.
+- Add integration checks for unrecognized feature categories, critical scheduling infeasibility, and database rollback.
+
+C. Advanced/research-level
+- Quantify uncertainty and calibration for priority/risk outputs using held-out operational data.
+- Optimize using richer operational timetables, possessions, geography, and resource skills when those data become available.
+- Evaluate resilience and sensitivity to priority threshold, crew availability, and solver time.
+
+D. Production-level
+- Establish deployment, secret management, TLS, backups, health monitoring, alerting, model/version governance, and database least privilege.
+- Obtain railway operations/safety validation before using schedules as anything other than decision support.
+
+
+27. PROJECT EXPLANATION FOR VIVA
+-------------------------------
+
+30-second explanation:
+RailOpt AI is a railway maintenance decision-support prototype. It takes asset condition and operating information, uses a trained XGBoost regression model to estimate maintenance priority, and passes those scores to an OR-Tools CP-SAT scheduler. The scheduler creates maintenance block times while respecting crew, track conflict, allowed window, and critical deadline constraints. A FastAPI backend persists the results in PostgreSQL. The training workbook is synthetic and the Streamlit dashboard is still a prototype shell.
+
+1-minute explanation:
+The offline pipeline uses a 7,000-row synthetic railway dataset, feature transformations, and train/validation/test splits. The trained XGBoost model predicts a priority_score from 24 numeric features; it does not predict failure probability. At runtime, FastAPI validates the incoming asset data, loads the saved model and preprocessing artifacts, and scores each asset. CP-SAT then schedules those above the configured threshold under time-window, same-track, crew-capacity, and critical-asset rules. PostgreSQL stores asset state, prediction history, run, maintenance requests, schedule rows, and audit events. The API and DB health have been verified; UI integration and real-data validation remain future work.
+
+3-minute explanation:
+Railway maintenance planning must balance asset condition, limited maintenance crews, safe work windows, shared tracks, train disruption, and urgent jobs. RailOpt AI separates prediction from planning. The data stage starts with a synthetic Excel dataset. Existing preprocessing outputs create 70/15/15 train/validation/test CSVs, encode categorical columns, scale numerical columns, and add five derived signals. The training script compares two XGBoost regressors and selects the one with best validation R2, using RMSE as a tie-breaker. The saved model is wrapped to keep the score in 0-100; the backend loads the model, saved feature order, scaler, and six encoders at startup.
+
+An optimization request supplies assets and planning settings. The prediction service prepares the 24-feature frame and computes priority. Priority above the threshold is eligible; critical scores must meet their higher threshold. The CP-SAT model enumerates permitted maintenance windows, creates optional intervals, prevents overlapping work in a shared track/station group, and caps concurrent work by crews. It rewards scheduled/high-priority/early work and penalizes estimated train impact, duration, peak overlap, lack of alternate track, and critical daytime scheduling. The response returns schedule items and formula-based metrics, and the backend persists operational records in PostgreSQL.
+
+The database schema is managed through Alembic. The current local migration is 0001_initial_schema. FastAPI root/health and model/database startup have been verified. The schedule service was exercised previously with actual model/data against isolated SQLite, but optimization writes through the currently migrated PostgreSQL database still need a dedicated end-to-end test. The current Streamlit page has static metrics and placeholder prediction/optimization pages and is not connected to the backend.
+
+What technologies did you use?
+Python, FastAPI/Uvicorn, Pydantic, SQLAlchemy, PostgreSQL/Alembic, Pandas/NumPy, scikit-learn preprocessing, XGBoost regression, OR-Tools CP-SAT, Joblib, Jupyter, Matplotlib/Seaborn, and a partial Streamlit UI.
+
+Why Python?
+The project uses Python for its data processing, model training/inference, API, ORM access, and optimization integrations in one language. This answer describes the observed implementation, not a comparison benchmark.
+
+Why XGBoost?
+The training code compares a tree-based XGBRegressor with an XGBoost linear booster. The tree model had better validation R2/RMSE on the supplied synthetic splits and was saved. It was not proven superior on real railway data.
+
+Why optimization?
+An ML score ranks urgency but cannot coordinate shared time intervals, track conflicts, maintenance windows, crews, and critical deadlines. CP-SAT handles those discrete scheduling decisions and constraints.
+
+What is block planning?
+In this implementation it is assigning a maintenance task a start/end interval in a track/station group, with crew and time-window rules; the workbook itself does not contain a railway timetable or measured possession feed.
+
+How does the system maximize asset availability?
+The objective rewards scheduled work and prioritizes high scores/earlier completion while penalizing several disruption costs. The reported availability percentage is a scheduled-hours formula, not proof of increased real-world uptime.
+
+What is the input?
+Asset identity/type/zone/station and optional track ID, age, inspection/defect/maintenance history, traffic/speed/axle load, environment, crew, duration, alternate-track/passenger-peak flags, supplied failure-probability value, and planning controls.
+
+What is the output?
+Predicted priority, scheduled/not-scheduled disposition, start/end, crew label, solver/run metrics, and database records.
+
+What is the novelty?
+The implemented integration combines a trained priority regressor with CP-SAT block scheduling in a persisted FastAPI workflow. Novelty or research contribution has not been independently established by the repository.
+
+What are the limitations?
+Synthetic data, supplied rather than predicted failure probability, simplified operational inputs/availability metrics, unconnected UI, missing auth and automated tests, and no demonstrated real-world safety/operations validation.
+
+What would you improve?
+First test the API and persistence end-to-end against PostgreSQL; connect the UI to real API results; then evaluate with real labelled asset histories and railway-approved operational constraints.
+
+
+28. FINAL ONE-PAGE PROJECT SUMMARY
+----------------------------------
+
+Project: RailOpt AI.
+Objective: Rank railway asset maintenance priority and generate constraint-aware maintenance blocks.
+Problem: Coordinate urgency, limited crews, track access, time windows, critical deadlines, and train disruption.
+Users: Intended for railway maintenance planners/engineers/block controllers; user authorization is not yet wired.
+Input: Synthetic-data-trained model inputs provided in API asset requests plus planning controls.
+Processing: Pydantic validation, saved transformations, XGBoost inference, CP-SAT scheduling, SQLAlchemy persistence.
+ML: XGBRegressor predicts priority_score (0..100), using 24 numeric features.
+Optimization: OR-Tools CP-SAT with same-track no-overlap, crew cumulative capacity, allowed windows, critical schedule deadline, and weighted disruption objective.
+Backend: FastAPI with asset, prediction, optimization, health, and dashboard endpoints.
+Frontend: Streamlit shell; mostly placeholders; no backend integration.
+Database: PostgreSQL 17.11, SQLAlchemy ORM, Alembic migration 0001_initial_schema.
+APIs: /, /health, /assets, /prediction, /optimization, /dashboard/summary, /dashboard/charts, with asset detail/update/delete and batch prediction routes.
+Deployment: Local Windows PostgreSQL and Uvicorn were verified; no Docker/cloud deployment config found.
+Main libraries: FastAPI, Pydantic, SQLAlchemy, PostgreSQL driver, Alembic, Pandas, NumPy, scikit-learn, XGBoost, OR-Tools, Joblib.
+Main algorithms: Gradient-boosted regression, scaler/category encoding, engineered features, CP-SAT interval optimization.
+Output: Priority scores, maintenance schedule, crews, solver/availability proxy metrics, and persisted run history.
+Current status: Working model and backend optimization pipeline; DB migrated; health/root verified. API optimization was previously exercised with isolated SQLite, not yet reverified on PostgreSQL. UI remains disconnected. Data is synthetic.
+Future scope: Real operational datasets/labels, PostgreSQL-backed end-to-end tests, live frontend integration, authentication/authorization, validated availability KPI, safety review, and production operations.
+
+
+END OF REPORT

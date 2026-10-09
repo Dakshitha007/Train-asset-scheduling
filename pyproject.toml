@@ -1,0 +1,24 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "railopt-ai"
+version = "0.1.0"
+description = "AI-powered Railway Maintenance Optimization & Block Scheduling System for Smart India Hackathon"
+readme = "README.md"
+requires-python = ">=3.10"
+authors = [
+    { name = "RailOpt AI Team" }
+]
+dependencies = [
+    "numpy>=1.26.0",
+    "pandas>=2.2.0",
+    "scikit-learn>=1.4.0",
+    "pulp>=2.8.0",
+    "fastapi>=0.110.0"
+]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["src*", "app*", "backend*"]

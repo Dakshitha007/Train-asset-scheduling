@@ -1,0 +1,82 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# C extensions
+*.so
+
+# Distribution / packaging
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# Virtual Environments
+venv/
+.venv/
+ENV/
+env/
+env.bak/
+venv.bak/
+
+# Jupyter Notebook checkpoints
+.ipynb_checkpoints
+*/.ipynb_checkpoints/*
+
+# IDE and Editor configs
+.vscode/
+.idea/
+*.sublime-project
+*.sublime-workspace
+
+# Operating System files
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Environment variables & secrets
+.env
+.env.*
+!.env.example
+
+# Large Data files (Keep raw schemas, ignore large dumps)
+data/processed/*
+!data/processed/.gitkeep
+data/external/*
+!data/external/.gitkeep
+
+# Model weights & checkpoints (track architecture, ignore heavy binaries)
+outputs/models/*.pkl
+outputs/models/*.joblib
+outputs/models/*.pt
+outputs/models/*.onnx
+!outputs/models/.gitkeep
+
+# Generated Outputs & Reports
+outputs/figures/*.png
+outputs/figures/*.jpg
+outputs/figures/*.svg
+!outputs/figures/.gitkeep
+outputs/reports/*.pdf
+outputs/reports/*.html
+!outputs/reports/.gitkeep
+
+# Logs
+*.log
+logs/
+*.db

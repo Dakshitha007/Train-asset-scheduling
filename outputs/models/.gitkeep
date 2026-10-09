@@ -1,0 +1,2 @@
+# Models output directory
+# Store serialized trained models, encoders, and scaler artifacts here (.pkl, .joblib, .json).
